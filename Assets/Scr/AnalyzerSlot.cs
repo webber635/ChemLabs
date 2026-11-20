@@ -28,4 +28,13 @@ public class AnalyzerSlot : MonoBehaviour
             Mission1Manager.Instance.CheckBeakerSample(beaker);
         }
     }
+
+    // Tambahkan fungsi ini di dalam AnalyzerSlot.cs
+    public void TriggerDesktopAnalysis(BeakerContainer beaker)
+    {
+        if (beaker != null)
+        {
+            Mission1Manager.Instance.CheckBeakerSample(beaker);
+        }
+    }
 }
