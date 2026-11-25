@@ -6,9 +6,9 @@ using TMPro;
 [Serializable]
 public class ChemicalTarget
 {
-    public string chemicalName;     // Contoh: "Aquades"
-    public float targetPercentage;  // Contoh: 70f (%)
-    public float percentTolerance = 3f; // Toleransi +/- 3%
+    public string chemicalName;       // Contoh: "Akuades"
+    public float targetPercentage;    // Contoh: 70f (%)
+    public float percentTolerance = 5f; // Toleransi +/- %
 }
 
 public class Mission1Manager : MonoBehaviour
@@ -18,7 +18,8 @@ public class Mission1Manager : MonoBehaviour
     [Header("Target Misi 1")]
     public string productName = "Cairan Pembersih Kaca (Eco Glass Cleaner)";
     public float targetTotalVolume = 100f;
-    public float volumeTolerance = 5f; // Sah jika 95 ml - 105 ml
+    public float volumeTolerance = 5f;
+    public int basePrice = 100; // Harga dasar untuk akurasi 100%
     public List<ChemicalTarget> recipeTargets;
 
     [Header("Referensi UI Monitor Analyzer")]
@@ -40,11 +41,12 @@ public class Mission1Manager : MonoBehaviour
     private void SetupMissionUI()
     {
         if (analyzerTitleText != null)
-            analyzerTitleText.text = $"MISI 1: {productName}";
+            analyzerTitleText.text = $"ANALYZER: {productName}";
 
         if (analyzerRecipeText != null)
         {
-            string info = $"Target Volume: <b>{targetTotalVolume} ml</b> (±{volumeTolerance} ml)\nKomposisi:\n";
+            string info = $"Target Volume: <b>{targetTotalVolume} ml</b> (±{volumeTolerance} ml)\n" +
+                          $"Harga Dasar: <b>{basePrice} Koin</b>\nKomposisi:\n";
             foreach (var item in recipeTargets)
             {
                 info += $"• {item.chemicalName}: <b>{item.targetPercentage}%</b> (±{item.percentTolerance}%)\n";
@@ -56,51 +58,86 @@ public class Mission1Manager : MonoBehaviour
             analyzerResultText.text = "<color=white>Status: Menunggu sampel gelas ukur...</color>";
     }
 
-    public void CheckBeakerSample(BeakerContainer beaker)
+    /// <summary>
+    /// Dipanggil secara real-time oleh BeakerContainer saat cairan dituang.
+    /// Jika bahan asing masuk atau volume suatu bahan melewati batas maksimum toleransi, langsung menguap.
+    /// </summary>
+    public bool ValidateRealTimePour(string incomingChem, float projectedChemVolume, float projectedTotalVolume, out string failReason)
     {
-        if (beaker.currentVolume <= 1f)
+        failReason = "";
+
+        ChemicalTarget target = recipeTargets.Find(t => t.chemicalName == incomingChem);
+        if (target == null)
         {
-            analyzerResultText.text = "<color=yellow>Gelas masih kosong! Silakan racik larutan terlebih dahulu.</color>";
-            return;
+            failReason = $"{incomingChem} tidak ada di resep!";
+            return false;
         }
 
-        // 1. Cek Total Volume
-        float volDiff = Mathf.Abs(beaker.currentVolume - targetTotalVolume);
-        bool isVolumeValid = volDiff <= volumeTolerance;
+        // Hitung batas maksimal ml berdasarkan target total volume (100 ml) + toleransi persentase
+        // Contoh: Target 70% +/- 5% dari 100 ml -> maksimal 75 ml (+ sedikit buffer 1 ml untuk presisi tuang)
+        float maxAllowedPercent = target.targetPercentage + target.percentTolerance;
+        float maxAllowedMl = (maxAllowedPercent / 100f) * targetTotalVolume + 1.0f;
 
-        // 2. Cek Persentase tiap Bahan & pastikan tidak ada bahan asing
-        bool isCompositionValid = true;
-        List<string> allowedNames = new List<string>();
+        if (projectedChemVolume > maxAllowedMl)
+        {
+            failReason = $"{incomingChem} melebihi batas toleransi ({maxAllowedPercent:F0}%)!";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Mengevaluasi akurasi campuran dan menghitung bayaran koin (tidak ada gagal di Analyzer).
+    /// </summary>
+    public int EvaluateAccuracyAndPayout(BeakerContainer beaker, out float accuracyPercent)
+    {
+        if (beaker == null || beaker.currentVolume <= 1f)
+        {
+            accuracyPercent = 0f;
+            if (analyzerResultText != null)
+                analyzerResultText.text = "<color=yellow>Gelas kosong! Tidak ada nilai jual.</color>";
+            return 0;
+        }
+
+        // 1. Hitung skor akurasi persentase tiap bahan (bobot 70%)
+        float totalChemScore = 0f;
         string detailReport = "";
 
         foreach (var target in recipeTargets)
         {
-            allowedNames.Add(target.chemicalName);
             float actualPercent = beaker.GetPercentageOf(target.chemicalName);
-            float percentDiff = Mathf.Abs(actualPercent - target.targetPercentage);
+            float diff = Mathf.Abs(actualPercent - target.targetPercentage);
 
-            if (percentDiff > target.percentTolerance)
-            {
-                isCompositionValid = false;
-            }
-            detailReport += $"{target.chemicalName}: {actualPercent:F1}% (Target {target.targetPercentage}%)\n";
+            // Skor 1.0 jika selisih 0, berkurang proporsional hingga 0 jika selisih >= 25%
+            float itemAccuracy = Mathf.Clamp01(1f - (diff / 25f));
+            totalChemScore += itemAccuracy;
+
+            detailReport += $"• {target.chemicalName}: {actualPercent:F1}% (Target {target.targetPercentage}%)\n";
         }
 
-        bool hasForeignChem = beaker.HasOtherChemicals(allowedNames);
+        float avgChemAccuracy = recipeTargets.Count > 0 ? (totalChemScore / recipeTargets.Count) : 0f;
 
-        // 3. Keputusan Akhir Mesin Analyzer
-        if (isVolumeValid && isCompositionValid && !hasForeignChem)
+        // 2. Hitung skor akurasi total volume terhadap 100 ml (bobot 30%)
+        float volDiff = Mathf.Abs(beaker.currentVolume - targetTotalVolume);
+        float volAccuracy = Mathf.Clamp01(1f - (volDiff / 50f));
+
+        // Gabungkan akurasi akhir (0% - 100%)
+        float finalRatio = (avgChemAccuracy * 0.7f) + (volAccuracy * 0.3f);
+        accuracyPercent = Mathf.Round(finalRatio * 1000f) / 10f; // 1 angka di belakang koma
+
+        // Hitung harga koin (minimal 5 koin jika berisi larutan)
+        int payout = Mathf.Max(5, Mathf.RoundToInt(basePrice * finalRatio));
+
+        if (analyzerResultText != null)
         {
-            analyzerResultText.text = $"<color=green><b>LULUS UJI MUTU!</b>\nProduk {productName} berhasil dibuat.</color>\n{detailReport}";
+            string gradeColor = accuracyPercent >= 85f ? "green" : (accuracyPercent >= 60f ? "yellow" : "orange");
+            analyzerResultText.text =
+                $"<color={gradeColor}><b>HASIL ANALISIS SELESAI</b>\n" +
+                $"Akurasi Mutu: <b>{accuracyPercent:F1}%</b>\n" +
+                $"Nilai Tukar: <b>{payout} Koin</b></color>\n{detailReport}";
         }
-        else
-        {
-            string reason = hasForeignChem ? "Tercampur bahan kimia di luar resep!" :
-                            (!isVolumeValid ? $"Total volume {beaker.currentVolume:F1} ml tidak sesuai target {targetTotalVolume} ml!" :
-                            "Rasio persentase komposisi meleset!");
 
-            analyzerResultText.text = $"<color=red><b>REAKSI GAGAL / MELEDAK!</b>\n{reason}</color>";
-            beaker.TriggerReactionExplosion();
-        }
+        return payout;
     }
 }

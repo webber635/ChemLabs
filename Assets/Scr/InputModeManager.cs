@@ -1,43 +1,31 @@
 using UnityEngine;
-using UnityEngine.XR;
+using UnityEngine.Events;
 
 public class InputModeManager : MonoBehaviour
 {
     [Header("Player Rigs")]
-    public GameObject vrOriginRig;
     public GameObject desktopPlayerRig;
+    public GameObject vrOriginRig; // Biarkan kosong sementara; isi saat menambahkan VR di akhir
 
-    [Header("Pengaturan Mode (Pilih Salah Satu atau Kosongkan untuk Auto)")]
-    public bool forceDesktopMode = false;
-    public bool forceVRMode = false; // Centang ini saat tes XR Device Simulator di laptop
+    [Header("Pengaturan Awal")]
+    public bool startInVRMode = false;
 
-    [Header("Opsional: Simulator VR di Laptop")]
-    public GameObject xrDeviceSimulator;
+    [Header("Event Pergantian Mode")]
+    public UnityEvent<bool> onInputModeChanged; // true = VR, false = Desktop
 
     private bool isVRMode;
 
     void Start()
     {
-        bool headsetDetected = XRSettings.isDeviceActive;
-
-        if (forceDesktopMode)
-        {
-            SetInputMode(false);
-        }
-        else if (forceVRMode || headsetDetected)
-        {
-            SetInputMode(true);
-        }
-        else
-        {
-            SetInputMode(false);
-        }
+        // Otomatis jatuh ke Desktop jika vrOriginRig belum dipasang
+        bool useVR = startInVRMode && (vrOriginRig != null);
+        SetInputMode(useVR);
     }
 
     void Update()
     {
-        // Tekan F1 kapan saja saat Play untuk berpindah antara VR dan Desktop
-        if (Input.GetKeyDown(KeyCode.F1))
+        // F1 hanya berpindah ke VR jika vrOriginRig sudah terpasang di scene
+        if (Input.GetKeyDown(KeyCode.F1) && vrOriginRig != null)
         {
             SetInputMode(!isVRMode);
         }
@@ -45,20 +33,15 @@ public class InputModeManager : MonoBehaviour
 
     public void SetInputMode(bool useVR)
     {
-        isVRMode = useVR;
+        isVRMode = useVR && (vrOriginRig != null);
 
-        if (vrOriginRig != null) vrOriginRig.SetActive(isVRMode);
         if (desktopPlayerRig != null) desktopPlayerRig.SetActive(!isVRMode);
-
-        // Nyalakan XR Device Simulator hanya jika di mode VR dan tidak pakai headset fisik
-        if (xrDeviceSimulator != null)
-        {
-            xrDeviceSimulator.SetActive(isVRMode && !XRSettings.isDeviceActive);
-        }
+        if (vrOriginRig != null) vrOriginRig.SetActive(isVRMode);
 
         Cursor.lockState = isVRMode ? CursorLockMode.None : CursorLockMode.Locked;
         Cursor.visible = isVRMode;
 
+        onInputModeChanged?.Invoke(isVRMode);
         Debug.Log($"Mode Input Aktif: {(isVRMode ? "VR" : "Desktop")}");
     }
 

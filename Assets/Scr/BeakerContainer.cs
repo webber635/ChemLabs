@@ -7,11 +7,11 @@ public class BeakerContainer : MonoBehaviour
     [Header("Referensi Visual & UI Gelas")]
     public Transform liquidPivot;
     public Renderer liquidRenderer;
-    public TextMeshProUGUI beakerInfoText; // UI kecil melayang di sebelah gelas
+    public TextMeshProUGUI beakerInfoText;
 
     [Header("Kapasitas & Batas Luapan (ml)")]
     public float maxVisualVolume = 100f;
-    public float overflowLimit = 105f; // Melewati batas ini -> cairan menguap habis
+    public float overflowLimit = 105f;
     public float currentVolume = 0f;
 
     private Dictionary<string, float> liquidVolumes = new Dictionary<string, float>();
@@ -25,19 +25,31 @@ public class BeakerContainer : MonoBehaviour
 
     public void AddLiquid(string chemName, float amount, Color addedColor)
     {
-        currentVolume += amount;
+        float projectedTotal = currentVolume + amount;
+        float existingChemVol = liquidVolumes.ContainsKey(chemName) ? liquidVolumes[chemName] : 0f;
+        float projectedChemVol = existingChemVol + amount;
 
-        // Cek efek gagal 1: Jika melebihi batas (Over-volume), cairan menguap habis
-        if (currentVolume > overflowLimit)
+        // 1. Cek batas maksimal total volume (105 ml)
+        if (projectedTotal > overflowLimit)
         {
-            TriggerEvaporation();
+            TriggerEvaporation("Melebihi batas 105 ml!");
             return;
         }
 
-        if (liquidVolumes.ContainsKey(chemName))
+        // 2. Cek batas toleransi Misi 1 secara real-time saat penuangan
+        if (Mission1Manager.Instance != null)
         {
-            liquidVolumes[chemName] += amount;
+            if (!Mission1Manager.Instance.ValidateRealTimePour(chemName, projectedChemVol, projectedTotal, out string failReason))
+            {
+                TriggerEvaporation(failReason);
+                return;
+            }
         }
+
+        currentVolume = projectedTotal;
+
+        if (liquidVolumes.ContainsKey(chemName))
+            liquidVolumes[chemName] += amount;
         else
         {
             liquidVolumes.Add(chemName, amount);
@@ -48,22 +60,18 @@ public class BeakerContainer : MonoBehaviour
         UpdateBeakerUI();
     }
 
-    // Menghitung persentase komposisi bahan tertentu (%)
     public float GetPercentageOf(string chemName)
     {
         if (currentVolume <= 0.001f || !liquidVolumes.ContainsKey(chemName)) return 0f;
         return (liquidVolumes[chemName] / currentVolume) * 100f;
     }
 
-    // Mengecek apakah ada bahan asing di luar daftar resep
     public bool HasOtherChemicals(List<string> allowedChemicals)
     {
         foreach (var key in liquidVolumes.Keys)
         {
             if (!allowedChemicals.Contains(key) && liquidVolumes[key] > 0.5f)
-            {
                 return true;
-            }
         }
         return false;
     }
@@ -132,25 +140,13 @@ public class BeakerContainer : MonoBehaviour
         }
     }
 
-    // Efek Gagal 1: Cairan menguap habis saat terlalu penuh
-    public void TriggerEvaporation()
+    public void TriggerEvaporation(string reason = "Melebihi batas!")
     {
-        Debug.LogWarning("OVER-VOLUME! Cairan meluap dan menguap habis.");
+        Debug.LogWarning($"MENGUAP HABIS! {reason}");
         ClearBeaker();
         if (beakerInfoText != null)
         {
-            beakerInfoText.text = "<color=yellow>MENGUAP HABIS!\n(Melebihi 105 ml)</color>";
-        }
-    }
-
-    // Efek Gagal 2: Reaksi gagal saat diuji di Analyzer
-    public void TriggerReactionExplosion()
-    {
-        Debug.LogWarning("REAKSI GAGAL! Komposisi tidak sesuai target.");
-        ClearBeaker();
-        if (beakerInfoText != null)
-        {
-            beakerInfoText.text = "<color=red>REAKSI GAGAL!\n(Komposisi Salah)</color>";
+            beakerInfoText.text = $"<color=yellow>MENGUAP HABIS!\n({reason})</color>";
         }
     }
 

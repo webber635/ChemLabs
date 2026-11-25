@@ -1,20 +1,27 @@
 using UnityEngine;
-using UnityEngine.XR.Interaction.Toolkit;
+using UnityEngine.Events;
 using TMPro;
+
+
 
 [RequireComponent(typeof(CharacterController))]
 public class DesktopLabController : MonoBehaviour
 {
-    public enum DesktopState { Idle, HoldingBottle, Pouring, HoldingBeaker }
+    public enum DesktopState { Idle, HoldingBottle, Pouring, HoldingBeaker, Placing }
     public DesktopState currentState = DesktopState.Idle;
 
     [Header("Referensi Kamera & Titik Jangkar")]
     public Camera playerCamera;
-    public Transform holdPoint;              // Posisi tangan kanan di depan kamera
-    public Transform pourAnchor;             // Titik statis di atas Beaker saat menuang
-    public GameObject pourBluePreview;       // Visual siluet biru di atas Beaker
-    public Transform analyzerAnchor;         // Titik dudukan Beaker di dalam slot Analyzer
-    public GameObject analyzerBluePreview;   // Visual siluet biru di slot Analyzer (opsional)
+    public Transform holdPoint;
+    public Transform pourAnchor;
+    public GameObject pourBluePreview;
+    public Transform analyzerAnchor;
+
+    [Header("Pengaturan Put State (Dynamic Ghost Preview)")]
+    public Material previewMaterial;
+    public LayerMask placeableSurfaceMask = ~0;
+    [Range(0.5f, 1f)]
+    public float minSurfaceUpNormal = 0.75f;
 
     [Header("Referensi Objek Lab")]
     public AnalyzerSlot analyzerSlot;
@@ -29,19 +36,39 @@ public class DesktopLabController : MonoBehaviour
     public float scrollTiltSpeed = 120f;
     public TextMeshProUGUI crosshairHintText;
 
+    [Header("Hook Kompatibilitas VR (Opsional)")]
+    public UnityEvent<GameObject> onDesktopGrab;
+    public UnityEvent<GameObject> onDesktopRelease;
+
     private CharacterController characterController;
     private Vector3 verticalVelocity;
 
     private GameObject heldObject;
     private Rigidbody heldObjRb;
-    private XRGrabInteractable heldObjXR;
-    private Vector3 objOriginPos;
-    private Quaternion objOriginRot;
+    private Collider[] heldObjColliders;
     private BeakerContainer heldBeakerComponent;
+    private DesktopState previousHoldingState;
+
+    private GameObject dynamicGhostPreview;
+    private float heldBottomOffset = 0f;
 
     private float cameraPitch = 0f;
     private float currentTiltAngle = 0f;
 
+    private bool hasValidPlacement = false;
+    private bool isSnappedToAnalyzer = false;
+    private Vector3 targetPlacePos;
+    private Quaternion targetPlaceRot;
+    private AnalyzerSlot detectedAnalyzerSlot;
+
+    [Header("Kamera Fokus Mode Tuang")]
+    public Transform pouringCameraAnchor; // Opsional: titik kamera tetap menghadap Beaker (jika kosong, otomatis membidik Beaker)
+    public float cameraLockSpeed = 8f;
+
+    private Vector3 savedCamLocalPos;
+    private Quaternion savedCamLocalRot;
+    private Vector3 targetPourCamWorldPos;
+    private Quaternion targetPourCamWorldRot;
     void Awake()
     {
         characterController = GetComponent<CharacterController>();
@@ -50,12 +77,10 @@ public class DesktopLabController : MonoBehaviour
     void Start()
     {
         if (pourBluePreview != null) pourBluePreview.SetActive(false);
-        if (analyzerBluePreview != null) analyzerBluePreview.SetActive(false);
     }
 
     void Update()
     {
-        // Pemain hanya bisa berjalan dan menoleh saat tidak sedang fokus menuang
         if (currentState != DesktopState.Pouring)
         {
             HandleMovement();
@@ -76,18 +101,20 @@ public class DesktopLabController : MonoBehaviour
             case DesktopState.HoldingBeaker:
                 HandleHoldingBeakerState();
                 break;
+            case DesktopState.Placing:
+                HandlePlacingState();
+                break;
         }
     }
 
     private void HandleMovement()
     {
-        float moveX = Input.GetAxis("Horizontal"); // A & D
-        float moveZ = Input.GetAxis("Vertical");   // W & S
+        float moveX = Input.GetAxis("Horizontal");
+        float moveZ = Input.GetAxis("Vertical");
 
         Vector3 move = (transform.right * moveX) + (transform.forward * moveZ);
         characterController.Move(move * moveSpeed * Time.deltaTime);
 
-        // Terapkan gravitasi ringan agar karakter tetap menapak di lantai lab
         if (characterController.isGrounded && verticalVelocity.y < 0)
         {
             verticalVelocity.y = -2f;
@@ -109,25 +136,69 @@ public class DesktopLabController : MonoBehaviour
     private void HandleIdleState()
     {
         if (pourBluePreview != null) pourBluePreview.SetActive(false);
-        if (analyzerBluePreview != null) analyzerBluePreview.SetActive(false);
-        crosshairHintText.text = "";
+        DestroyGhostPreview();
+        if (crosshairHintText != null) crosshairHintText.text = "";
 
         Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
-        if (Physics.Raycast(ray, out RaycastHit hit, interactRange))
+        if (Physics.Raycast(ray, out RaycastHit hit, interactRange, ~0, QueryTriggerInteraction.Collide))
         {
-            // 1. Arahkan ke Botol Kimia -> [E] Ambil
+            // 1. Cek interaksi jika mengarah ke Slot Analyzer (atau Beaker yang sedang ada di dalam Slot)
+            AnalyzerSlot hitSlot = hit.collider.GetComponent<AnalyzerSlot>() ??
+                                   hit.collider.GetComponentInParent<AnalyzerSlot>() ??
+                                   hit.collider.GetComponentInChildren<AnalyzerSlot>();
+
+            // Jika mengenai Beaker yang berada di Analyzer, arahkan interaksi ke analyzerSlot
+            if (hitSlot == null && hit.collider.GetComponent<BeakerContainer>() != null &&
+                analyzerSlot != null && analyzerSlot.IsBusyOrOccupied)
+            {
+                // Cek apakah Beaker tersebut berada tepat di dekat analyzerAnchor
+                if (analyzerAnchor != null && Vector3.Distance(hit.collider.transform.position, analyzerAnchor.position) < 0.5f)
+                {
+                    hitSlot = analyzerSlot;
+                }
+            }
+
+            if (hitSlot != null && hitSlot.IsBusyOrOccupied)
+            {
+                if (crosshairHintText != null)
+                    crosshairHintText.text = hitSlot.GetInteractionHint();
+
+                if (Input.GetKeyDown(KeyCode.E))
+                {
+                    if (hitSlot.currentState == AnalyzerSlot.SlotState.CoinReady)
+                    {
+                        hitSlot.CollectCoin();
+                    }
+                    else if (hitSlot.currentState == AnalyzerSlot.SlotState.BeakerReady)
+                    {
+                        BeakerContainer beaker = hitSlot.RetrieveBeaker();
+                        if (beaker != null)
+                        {
+                            heldBeakerComponent = beaker;
+                            PickUpObject(beaker.gameObject, DesktopState.HoldingBeaker);
+                        }
+                    }
+                }
+                return;
+            }
+
+            // 2. Cek Botol Kimia
             if (hit.collider.TryGetComponent(out PourDetector detector))
             {
-                crosshairHintText.text = $"[E] Ambil {detector.chemicalName}";
+                if (crosshairHintText != null)
+                    crosshairHintText.text = $"[E] Ambil {detector.chemicalName}";
+
                 if (Input.GetKeyDown(KeyCode.E))
                 {
                     PickUpObject(detector.gameObject, DesktopState.HoldingBottle);
                 }
             }
-            // 2. Arahkan ke Gelas Beaker -> [E] Ambil Beaker | [R] Kosongkan Isi
+            // 3. Cek Gelas Beaker di meja
             else if (hit.collider.TryGetComponent(out BeakerContainer beaker))
             {
-                crosshairHintText.text = "[E] Ambil Gelas Beaker | [R] Buang Isi";
+                if (crosshairHintText != null)
+                    crosshairHintText.text = "[E] Ambil Gelas Beaker | [R] Buang Isi";
+
                 if (Input.GetKeyDown(KeyCode.E))
                 {
                     heldBeakerComponent = beaker;
@@ -143,11 +214,12 @@ public class DesktopLabController : MonoBehaviour
 
     private void HandleHoldingBottleState()
     {
-        crosshairHintText.text = "[Q] Kembalikan Botol ke Meja";
+        if (crosshairHintText != null)
+            crosshairHintText.text = "[Q] Mode Letakkan Barang";
 
         if (Input.GetKeyDown(KeyCode.Q))
         {
-            ReturnObjectToOrigin();
+            EnterPlacingState(DesktopState.HoldingBottle);
             return;
         }
 
@@ -159,7 +231,9 @@ public class DesktopLabController : MonoBehaviour
 
         if (aimingAtBeaker)
         {
-            crosshairHintText.text = "[Klik Kanan] Masuk Mode Tuang";
+            if (crosshairHintText != null)
+                crosshairHintText.text = "[Klik Kanan] Masuk Mode Tuang | [Q] Letakkan";
+
             if (Input.GetMouseButtonDown(1))
             {
                 EnterPouringState();
@@ -169,7 +243,23 @@ public class DesktopLabController : MonoBehaviour
 
     private void HandlePouringState()
     {
-        crosshairHintText.text = "[Scroll Wheel] Miringkan Botol | [Klik Kanan / E] Selesai Tuang";
+        if (crosshairHintText != null)
+            crosshairHintText.text = "[Scroll Wheel] Miringkan Botol | [Klik Kanan / E] Selesai Tuang";
+
+        // Kunci dan arahkan kamera secara halus ke posisi fokus penuangan
+        if (playerCamera != null)
+        {
+            playerCamera.transform.position = Vector3.Lerp(
+                playerCamera.transform.position,
+                targetPourCamWorldPos,
+                Time.deltaTime * cameraLockSpeed
+            );
+            playerCamera.transform.rotation = Quaternion.Slerp(
+                playerCamera.transform.rotation,
+                targetPourCamWorldRot,
+                Time.deltaTime * cameraLockSpeed
+            );
+        }
 
         float scroll = Input.mouseScrollDelta.y;
         if (Mathf.Abs(scroll) > 0.01f)
@@ -186,64 +276,225 @@ public class DesktopLabController : MonoBehaviour
 
     private void HandleHoldingBeakerState()
     {
-        crosshairHintText.text = "[Q] Kembalikan Beaker ke Meja";
+        if (crosshairHintText != null)
+            crosshairHintText.text = "[Q] Mode Letakkan Barang";
 
         if (Input.GetKeyDown(KeyCode.Q))
         {
-            heldBeakerComponent = null;
-            ReturnObjectToOrigin();
+            EnterPlacingState(DesktopState.HoldingBeaker);
+        }
+    }
+
+    private void EnterPlacingState(DesktopState fromState)
+    {
+        previousHoldingState = fromState;
+        if (pourBluePreview != null) pourBluePreview.SetActive(false);
+
+        CreateGhostPreviewFromHeldObject();
+        currentState = DesktopState.Placing;
+    }
+
+    private void CreateGhostPreviewFromHeldObject()
+    {
+        DestroyGhostPreview();
+        if (heldObject == null) return;
+
+        dynamicGhostPreview = Instantiate(heldObject);
+        dynamicGhostPreview.name = "DynamicGhostPreview";
+        dynamicGhostPreview.transform.SetParent(null);
+        dynamicGhostPreview.transform.localScale = heldObject.transform.lossyScale;
+
+        foreach (var col in dynamicGhostPreview.GetComponentsInChildren<Collider>(true))
+            Destroy(col);
+
+        foreach (var rb in dynamicGhostPreview.GetComponentsInChildren<Rigidbody>(true))
+            Destroy(rb);
+
+        foreach (var canvas in dynamicGhostPreview.GetComponentsInChildren<Canvas>(true))
+            Destroy(canvas.gameObject);
+
+        foreach (var mb in dynamicGhostPreview.GetComponentsInChildren<MonoBehaviour>(true))
+            Destroy(mb);
+
+        if (previewMaterial != null)
+        {
+            foreach (var mr in dynamicGhostPreview.GetComponentsInChildren<MeshRenderer>(true))
+            {
+                Material[] mats = new Material[mr.sharedMaterials.Length];
+                for (int i = 0; i < mats.Length; i++) mats[i] = previewMaterial;
+                mr.sharedMaterials = mats;
+                mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                mr.receiveShadows = false;
+            }
+        }
+
+        dynamicGhostPreview.SetActive(false);
+    }
+
+    private void DestroyGhostPreview()
+    {
+        if (dynamicGhostPreview != null)
+        {
+            Destroy(dynamicGhostPreview);
+            dynamicGhostPreview = null;
+        }
+    }
+
+    private void HandlePlacingState()
+    {
+        if (Input.GetKeyDown(KeyCode.Q))
+        {
+            DestroyGhostPreview();
+            currentState = previousHoldingState;
             return;
         }
 
+        hasValidPlacement = false;
+        isSnappedToAnalyzer = false;
+        detectedAnalyzerSlot = null;
+
         Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
-        
-        // Gunakan QueryTriggerInteraction.Collide agar Collider Trigger (seperti Socket VR) tetap terbaca
-        if (Physics.Raycast(ray, out RaycastHit hit, interactRange, ~0, QueryTriggerInteraction.Collide))
+
+        // 1. Jika membawa Beaker & diarahkan ke mesin Analyzer yang kosong
+        if (heldBeakerComponent != null &&
+            Physics.Raycast(ray, out RaycastHit triggerHit, interactRange, ~0, QueryTriggerInteraction.Collide))
         {
-            // Cek AnalyzerSlot di objek yang kena hit, induknya, atau anak-anaknya
-            AnalyzerSlot detectedSlot = hit.collider.GetComponent<AnalyzerSlot>() ??
-                                        hit.collider.GetComponentInParent<AnalyzerSlot>() ??
-                                        hit.collider.GetComponentInChildren<AnalyzerSlot>();
+            AnalyzerSlot slot = triggerHit.collider.GetComponent<AnalyzerSlot>() ??
+                                triggerHit.collider.GetComponentInParent<AnalyzerSlot>() ??
+                                triggerHit.collider.GetComponentInChildren<AnalyzerSlot>();
 
-            if (detectedSlot != null)
+            if (slot != null && !slot.IsBusyOrOccupied)
             {
-                if (analyzerBluePreview != null) analyzerBluePreview.SetActive(true);
-                crosshairHintText.text = "[Klik Kanan / E] Taruh ke Slot Analyzer";
+                isSnappedToAnalyzer = true;
+                hasValidPlacement = true;
+                detectedAnalyzerSlot = slot;
 
-                if (Input.GetMouseButtonDown(1) || Input.GetKeyDown(KeyCode.E))
+                if (dynamicGhostPreview != null)
                 {
-                    analyzerSlot = detectedSlot;
-                    PlaceBeakerInAnalyzer();
+                    dynamicGhostPreview.SetActive(true);
+                    if (analyzerAnchor != null)
+                    {
+                        dynamicGhostPreview.transform.position = analyzerAnchor.position + Vector3.up * heldBottomOffset;
+                        dynamicGhostPreview.transform.rotation = analyzerAnchor.rotation;
+                    }
+                }
+
+                if (crosshairHintText != null)
+                    crosshairHintText.text = "[Klik Kiri] Masukkan ke Analyzer | [Q] Batal";
+
+                if (Input.GetMouseButtonDown(0))
+                {
+                    ConfirmPlacement();
                 }
                 return;
             }
-            else
+        }
+
+        // 2. Letakkan di permukaan meja mana pun yang valid
+        if (Physics.Raycast(ray, out RaycastHit surfaceHit, interactRange, placeableSurfaceMask, QueryTriggerInteraction.Ignore))
+        {
+            if (surfaceHit.normal.y >= minSurfaceUpNormal)
             {
-                // Log sementara untuk melihat objek apa yang menghalangi crosshair
-                Debug.Log("Crosshair mengenai: " + hit.collider.gameObject.name);
+                hasValidPlacement = true;
+                targetPlacePos = surfaceHit.point + (Vector3.up * heldBottomOffset);
+
+                Vector3 flatForward = Vector3.ProjectOnPlane(transform.forward, Vector3.up).normalized;
+                targetPlaceRot = flatForward.sqrMagnitude > 0.001f
+                    ? Quaternion.LookRotation(flatForward, Vector3.up)
+                    : Quaternion.identity;
+
+                if (dynamicGhostPreview != null)
+                {
+                    dynamicGhostPreview.SetActive(true);
+                    dynamicGhostPreview.transform.position = targetPlacePos;
+                    dynamicGhostPreview.transform.rotation = targetPlaceRot;
+                }
+
+                if (crosshairHintText != null)
+                    crosshairHintText.text = "[Klik Kiri] Letakkan di Sini | [Q] Batal";
+
+                if (Input.GetMouseButtonDown(0))
+                {
+                    ConfirmPlacement();
+                }
+                return;
             }
         }
 
-        if (analyzerBluePreview != null) analyzerBluePreview.SetActive(false);
+        if (dynamicGhostPreview != null) dynamicGhostPreview.SetActive(false);
+        if (crosshairHintText != null)
+            crosshairHintText.text = "<color=yellow>Arahkan ke permukaan meja</color> | [Q] Batal";
     }
 
-    private Collider[] heldObjColliders; // Tambahkan variabel ini di bagian atas bersama heldObjRb
+    private void ConfirmPlacement()
+    {
+        DestroyGhostPreview();
+
+        if (isSnappedToAnalyzer && heldBeakerComponent != null)
+        {
+            analyzerSlot = detectedAnalyzerSlot;
+            Vector3 seatedPos = analyzerAnchor != null ? analyzerAnchor.position + Vector3.up * heldBottomOffset : heldObject.transform.position;
+            Quaternion seatedRot = analyzerAnchor != null ? analyzerAnchor.rotation : Quaternion.identity;
+
+            heldObject.transform.SetParent(null);
+            heldObject.transform.position = seatedPos;
+            heldObject.transform.rotation = seatedRot;
+
+            if (analyzerSlot != null)
+            {
+                analyzerSlot.InsertSample(heldBeakerComponent, seatedPos, seatedRot);
+            }
+
+            onDesktopRelease?.Invoke(heldObject);
+            heldObject = null;
+            heldBeakerComponent = null;
+            currentState = DesktopState.Idle;
+            return;
+        }
+
+        if (hasValidPlacement && heldObject != null)
+        {
+            heldObject.transform.SetParent(null);
+            heldObject.transform.position = targetPlacePos;
+            heldObject.transform.rotation = targetPlaceRot;
+
+            if (heldObjColliders != null)
+            {
+                foreach (var col in heldObjColliders) col.enabled = true;
+            }
+
+            if (heldObjRb != null)
+            {
+                heldObjRb.isKinematic = false;
+                heldObjRb.velocity = Vector3.zero;
+                heldObjRb.angularVelocity = Vector3.zero;
+            }
+
+            onDesktopRelease?.Invoke(heldObject);
+            heldObject = null;
+            heldBeakerComponent = null;
+            currentState = DesktopState.Idle;
+        }
+    }
 
     private void PickUpObject(GameObject targetObj, DesktopState nextState)
     {
         heldObject = targetObj;
-        objOriginPos = targetObj.transform.position;
-        objOriginRot = targetObj.transform.rotation;
 
         if (heldObject.TryGetComponent(out heldObjRb)) heldObjRb.isKinematic = true;
-        if (heldObject.TryGetComponent(out heldObjXR)) heldObjXR.enabled = false;
 
-        // Matikan semua collider objek yang dipegang agar tidak menghalangi Raycast crosshair
+        heldObject.transform.SetParent(null);
+        heldObject.transform.rotation = Quaternion.identity;
+
         heldObjColliders = heldObject.GetComponentsInChildren<Collider>();
+        CalculateBottomOffset();
+
         foreach (var col in heldObjColliders)
         {
             col.enabled = false;
         }
+
+        onDesktopGrab?.Invoke(heldObject);
 
         heldObject.transform.SetParent(holdPoint);
         heldObject.transform.localPosition = Vector3.zero;
@@ -252,58 +503,55 @@ public class DesktopLabController : MonoBehaviour
         currentState = nextState;
     }
 
-    private void PlaceBeakerInAnalyzer()
+    private void CalculateBottomOffset()
     {
-        if (analyzerBluePreview != null) analyzerBluePreview.SetActive(false);
+        heldBottomOffset = 0f;
+        float lowestY = float.MaxValue;
+        bool foundMesh = false;
 
-        if (analyzerAnchor != null)
+        MeshRenderer[] renderers = heldObject.GetComponentsInChildren<MeshRenderer>();
+        foreach (var mr in renderers)
         {
-            heldObject.transform.SetParent(analyzerAnchor);
-            heldObject.transform.localPosition = Vector3.zero;
-            heldObject.transform.localRotation = Quaternion.identity;
+            if (!mr.enabled) continue;
+            if (mr.bounds.min.y < lowestY)
+            {
+                lowestY = mr.bounds.min.y;
+                foundMesh = true;
+            }
         }
 
-        // Nyalakan kembali collider Beaker setelah ditaruh di Analyzer
-        if (heldObjColliders != null)
+        if (foundMesh)
         {
-            foreach (var col in heldObjColliders) col.enabled = true;
+            heldBottomOffset = Mathf.Max(0f, heldObject.transform.position.y - lowestY);
         }
-
-        if (analyzerSlot != null && heldBeakerComponent != null)
-        {
-            analyzerSlot.TriggerDesktopAnalysis(heldBeakerComponent);
-        }
-
-        if (heldObjXR != null) heldObjXR.enabled = true;
-        heldObject = null;
-        heldBeakerComponent = null;
-        currentState = DesktopState.Idle;
     }
 
-    private void ReturnObjectToOrigin()
-    {
-        heldObject.transform.SetParent(null);
-        heldObject.transform.position = objOriginPos;
-        heldObject.transform.rotation = objOriginRot;
-
-        // Nyalakan kembali collider saat dikembalikan ke meja
-        if (heldObjColliders != null)
-        {
-            foreach (var col in heldObjColliders) col.enabled = true;
-        }
-
-        if (heldObjRb != null) heldObjRb.isKinematic = false;
-        if (heldObjXR != null) heldObjXR.enabled = true;
-
-        heldObject = null;
-        if (pourBluePreview != null) pourBluePreview.SetActive(false);
-        if (analyzerBluePreview != null) analyzerBluePreview.SetActive(false);
-        currentState = DesktopState.Idle;
-    }
+    
 
     private void EnterPouringState()
     {
         if (pourBluePreview != null) pourBluePreview.SetActive(false);
+
+        // Simpan posisi & rotasi lokal kamera sebelum dikunci
+        if (playerCamera != null)
+        {
+            savedCamLocalPos = playerCamera.transform.localPosition;
+            savedCamLocalRot = playerCamera.transform.localRotation;
+
+            if (pouringCameraAnchor != null)
+            {
+                targetPourCamWorldPos = pouringCameraAnchor.position;
+                targetPourCamWorldRot = pouringCameraAnchor.rotation;
+            }
+            else if (pourAnchor != null)
+            {
+                // Otomatis posisikan kamera sedikit di belakang & atas pourAnchor menghadap area tuang/Beaker
+                Vector3 viewOffset = (-transform.forward * 0.45f) + (Vector3.up * 0.15f);
+                targetPourCamWorldPos = pourAnchor.position + viewOffset;
+                Vector3 lookTarget = pourAnchor.position - (Vector3.up * 0.12f);
+                targetPourCamWorldRot = Quaternion.LookRotation((lookTarget - targetPourCamWorldPos).normalized, Vector3.up);
+            }
+        }
 
         heldObject.transform.SetParent(pourAnchor);
         heldObject.transform.localPosition = Vector3.zero;
@@ -319,6 +567,13 @@ public class DesktopLabController : MonoBehaviour
         heldObject.transform.SetParent(holdPoint);
         heldObject.transform.localPosition = Vector3.zero;
         heldObject.transform.localRotation = Quaternion.identity;
+
+        // Kembalikan kamera persis ke posisi & sudut pandang FPS semula
+        if (playerCamera != null)
+        {
+            playerCamera.transform.localPosition = savedCamLocalPos;
+            playerCamera.transform.localRotation = savedCamLocalRot;
+        }
 
         currentState = DesktopState.HoldingBottle;
     }
