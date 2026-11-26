@@ -2,8 +2,6 @@ using UnityEngine;
 using UnityEngine.Events;
 using TMPro;
 
-
-
 [RequireComponent(typeof(CharacterController))]
 public class DesktopLabController : MonoBehaviour
 {
@@ -12,13 +10,20 @@ public class DesktopLabController : MonoBehaviour
 
     [Header("Referensi Kamera & Titik Jangkar")]
     public Camera playerCamera;
-    public Transform holdPoint;
-    public Transform pourAnchor;
-    public GameObject pourBluePreview;
-    public Transform analyzerAnchor;
+    public Transform holdPoint;              // Posisi tangan kanan di depan kamera
+    public Transform pourAnchor;             // Titik jangkar botol saat menuang (akan diposisikan otomatis di atas Beaker)
+    public GameObject pourBluePreview;       // Visual siluet biru di atas Beaker saat mau menuang
+    public Transform analyzerAnchor;         // Titik dudukan Beaker di dalam slot Analyzer
+
+    [Header("Pengaturan Kamera & Posisi Tuang Dinamis")]
+    public float pourBottleHeightOffset = 0.28f; // Tinggi mulut botol di atas titik dasar Beaker
+    public float pourBottleSideOffset = 0.12f;   // Geser botol sedikit ke kanan agar tidak menutupi layar
+    public float pourCamDistance = 0.55f;        // Jarak kamera dari Beaker saat mode tuang
+    public float pourCamHeight = 0.35f;          // Tinggi kamera dari dasar Beaker saat mode tuang
+    public float cameraLockSpeed = 10f;
 
     [Header("Pengaturan Put State (Dynamic Ghost Preview)")]
-    public Material previewMaterial;
+    public Material previewMaterial;         // Masukkan Mat_BluePreview di sini
     public LayerMask placeableSurfaceMask = ~0;
     [Range(0.5f, 1f)]
     public float minSurfaceUpNormal = 0.75f;
@@ -47,6 +52,7 @@ public class DesktopLabController : MonoBehaviour
     private Rigidbody heldObjRb;
     private Collider[] heldObjColliders;
     private BeakerContainer heldBeakerComponent;
+    private BeakerContainer targetPourBeaker; // Beaker yang sedang dibidik untuk dituangi
     private DesktopState previousHoldingState;
 
     private GameObject dynamicGhostPreview;
@@ -55,20 +61,18 @@ public class DesktopLabController : MonoBehaviour
     private float cameraPitch = 0f;
     private float currentTiltAngle = 0f;
 
+    // Variabel kunci kamera saat Pouring
+    private Vector3 savedCamLocalPos;
+    private Quaternion savedCamLocalRot;
+    private Vector3 targetPourCamWorldPos;
+    private Quaternion targetPourCamWorldRot;
+
     private bool hasValidPlacement = false;
     private bool isSnappedToAnalyzer = false;
     private Vector3 targetPlacePos;
     private Quaternion targetPlaceRot;
     private AnalyzerSlot detectedAnalyzerSlot;
 
-    [Header("Kamera Fokus Mode Tuang")]
-    public Transform pouringCameraAnchor; // Opsional: titik kamera tetap menghadap Beaker (jika kosong, otomatis membidik Beaker)
-    public float cameraLockSpeed = 8f;
-
-    private Vector3 savedCamLocalPos;
-    private Quaternion savedCamLocalRot;
-    private Vector3 targetPourCamWorldPos;
-    private Quaternion targetPourCamWorldRot;
     void Awake()
     {
         characterController = GetComponent<CharacterController>();
@@ -142,16 +146,13 @@ public class DesktopLabController : MonoBehaviour
         Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
         if (Physics.Raycast(ray, out RaycastHit hit, interactRange, ~0, QueryTriggerInteraction.Collide))
         {
-            // 1. Cek interaksi jika mengarah ke Slot Analyzer (atau Beaker yang sedang ada di dalam Slot)
             AnalyzerSlot hitSlot = hit.collider.GetComponent<AnalyzerSlot>() ??
                                    hit.collider.GetComponentInParent<AnalyzerSlot>() ??
                                    hit.collider.GetComponentInChildren<AnalyzerSlot>();
 
-            // Jika mengenai Beaker yang berada di Analyzer, arahkan interaksi ke analyzerSlot
             if (hitSlot == null && hit.collider.GetComponent<BeakerContainer>() != null &&
                 analyzerSlot != null && analyzerSlot.IsBusyOrOccupied)
             {
-                // Cek apakah Beaker tersebut berada tepat di dekat analyzerAnchor
                 if (analyzerAnchor != null && Vector3.Distance(hit.collider.transform.position, analyzerAnchor.position) < 0.5f)
                 {
                     hitSlot = analyzerSlot;
@@ -182,7 +183,6 @@ public class DesktopLabController : MonoBehaviour
                 return;
             }
 
-            // 2. Cek Botol Kimia
             if (hit.collider.TryGetComponent(out PourDetector detector))
             {
                 if (crosshairHintText != null)
@@ -193,7 +193,6 @@ public class DesktopLabController : MonoBehaviour
                     PickUpObject(detector.gameObject, DesktopState.HoldingBottle);
                 }
             }
-            // 3. Cek Gelas Beaker di meja
             else if (hit.collider.TryGetComponent(out BeakerContainer beaker))
             {
                 if (crosshairHintText != null)
@@ -210,6 +209,21 @@ public class DesktopLabController : MonoBehaviour
                 }
             }
         }
+
+        // Cek interaksi dengan Monitor Komputer LabOS
+            LabOSInteractable computer = hit.collider.GetComponent<LabOSInteractable>() ??
+                                         hit.collider.GetComponentInParent<LabOSInteractable>();
+            if (computer != null)
+            {
+                if (crosshairHintText != null)
+                    crosshairHintText.text = "[E] Buka Komputer LabOS";
+
+                if (Input.GetKeyDown(KeyCode.E))
+                {
+                    computer.EnterComputer();
+                }
+                return;
+            }
     }
 
     private void HandleHoldingBottleState()
@@ -223,14 +237,35 @@ public class DesktopLabController : MonoBehaviour
             return;
         }
 
+        targetPourBeaker = null;
         Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
-        bool aimingAtBeaker = Physics.Raycast(ray, out RaycastHit hit, interactRange) &&
-                              hit.collider.GetComponent<BeakerContainer>() != null;
 
-        if (pourBluePreview != null) pourBluePreview.SetActive(aimingAtBeaker);
+        if (Physics.Raycast(ray, out RaycastHit hit, interactRange))
+        {
+            targetPourBeaker = hit.collider.GetComponent<BeakerContainer>() ??
+                               hit.collider.GetComponentInParent<BeakerContainer>();
+        }
+
+        bool aimingAtBeaker = targetPourBeaker != null;
 
         if (aimingAtBeaker)
         {
+            // Hitung posisi dinamis pourAnchor & preview berdasarkan arah datang pemain
+            CalculateDynamicPourPose(targetPourBeaker, out Vector3 anchorPos, out Quaternion anchorRot, out _, out _);
+
+            if (pourAnchor != null)
+            {
+                pourAnchor.position = anchorPos;
+                pourAnchor.rotation = anchorRot;
+            }
+
+            if (pourBluePreview != null)
+            {
+                pourBluePreview.SetActive(true);
+                pourBluePreview.transform.position = anchorPos;
+                pourBluePreview.transform.rotation = anchorRot;
+            }
+
             if (crosshairHintText != null)
                 crosshairHintText.text = "[Klik Kanan] Masuk Mode Tuang | [Q] Letakkan";
 
@@ -239,6 +274,43 @@ public class DesktopLabController : MonoBehaviour
                 EnterPouringState();
             }
         }
+        else
+        {
+            if (pourBluePreview != null) pourBluePreview.SetActive(false);
+        }
+    }
+
+    /// <summary>
+    /// Menghitung posisi botol dan kamera secara dinamis dari sisi pemain mana pun menghadap Beaker.
+    /// </summary>
+    private void CalculateDynamicPourPose(
+        BeakerContainer beaker,
+        out Vector3 bottleWorldPos,
+        out Quaternion bottleWorldRot,
+        out Vector3 camWorldPos,
+        out Quaternion camWorldRot)
+    {
+        Vector3 beakerBasePos = beaker.transform.position;
+
+        // Vektor arah horizontal dari Beaker menuju posisi pemain saat ini
+        Vector3 dirToPlayer = Vector3.ProjectOnPlane(transform.position - beakerBasePos, Vector3.up);
+        if (dirToPlayer.sqrMagnitude < 0.001f)
+            dirToPlayer = -transform.forward;
+        else
+            dirToPlayer.Normalize();
+
+        // Arah kanan dari sudut pandang pemain saat melihat Beaker
+        Vector3 rightFromPlayerView = Vector3.Cross(Vector3.up, -dirToPlayer).normalized;
+
+        // Posisi botol: di atas Beaker & sedikit di sisi kanan layar pemain
+        bottleWorldPos = beakerBasePos + (Vector3.up * pourBottleHeightOffset) + (rightFromPlayerView * pourBottleSideOffset);
+        // Rotasi botol menghadap ke arah Beaker (-dirToPlayer) sehingga miring Z positif selalu menuang ke kiri (ke dalam Beaker)
+        bottleWorldRot = Quaternion.LookRotation(-dirToPlayer, Vector3.up);
+
+        // Posisi kamera: di sisi pemain menghadap titik tengah antara Beaker dan mulut botol
+        camWorldPos = beakerBasePos + (dirToPlayer * pourCamDistance) + (Vector3.up * pourCamHeight);
+        Vector3 lookTarget = beakerBasePos + (Vector3.up * (pourBottleHeightOffset * 0.6f));
+        camWorldRot = Quaternion.LookRotation((lookTarget - camWorldPos).normalized, Vector3.up);
     }
 
     private void HandlePouringState()
@@ -246,7 +318,7 @@ public class DesktopLabController : MonoBehaviour
         if (crosshairHintText != null)
             crosshairHintText.text = "[Scroll Wheel] Miringkan Botol | [Klik Kanan / E] Selesai Tuang";
 
-        // Kunci dan arahkan kamera secara halus ke posisi fokus penuangan
+        // Transisi halus & kunci kamera ke posisi fokus tuang
         if (playerCamera != null)
         {
             playerCamera.transform.position = Vector3.Lerp(
@@ -265,6 +337,7 @@ public class DesktopLabController : MonoBehaviour
         if (Mathf.Abs(scroll) > 0.01f)
         {
             currentTiltAngle = Mathf.Clamp(currentTiltAngle + (scroll * scrollTiltSpeed * Time.deltaTime * 10f), 0f, 120f);
+            // Miringkan ke sumbu Z positif (ke arah kiri/dalam Beaker relatif terhadap kamera)
             heldObject.transform.localRotation = Quaternion.Euler(0f, 0f, currentTiltAngle);
         }
 
@@ -355,7 +428,6 @@ public class DesktopLabController : MonoBehaviour
 
         Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
 
-        // 1. Jika membawa Beaker & diarahkan ke mesin Analyzer yang kosong
         if (heldBeakerComponent != null &&
             Physics.Raycast(ray, out RaycastHit triggerHit, interactRange, ~0, QueryTriggerInteraction.Collide))
         {
@@ -390,7 +462,6 @@ public class DesktopLabController : MonoBehaviour
             }
         }
 
-        // 2. Letakkan di permukaan meja mana pun yang valid
         if (Physics.Raycast(ray, out RaycastHit surfaceHit, interactRange, placeableSurfaceMask, QueryTriggerInteraction.Ignore))
         {
             if (surfaceHit.normal.y >= minSurfaceUpNormal)
@@ -526,37 +597,42 @@ public class DesktopLabController : MonoBehaviour
         }
     }
 
-    
-
     private void EnterPouringState()
     {
         if (pourBluePreview != null) pourBluePreview.SetActive(false);
+        if (targetPourBeaker == null) return;
 
-        // Simpan posisi & rotasi lokal kamera sebelum dikunci
+        // Hitung posisi akhir botol & kamera dari arah datang pemain saat ini
+        CalculateDynamicPourPose(
+            targetPourBeaker,
+            out Vector3 bottleWorldPos,
+            out Quaternion bottleWorldRot,
+            out targetPourCamWorldPos,
+            out targetPourCamWorldRot
+        );
+
+        if (pourAnchor != null)
+        {
+            pourAnchor.position = bottleWorldPos;
+            pourAnchor.rotation = bottleWorldRot;
+            heldObject.transform.SetParent(pourAnchor);
+        }
+        else
+        {
+            heldObject.transform.SetParent(null);
+            heldObject.transform.position = bottleWorldPos;
+            heldObject.transform.rotation = bottleWorldRot;
+        }
+
+        heldObject.transform.localPosition = Vector3.zero;
+        heldObject.transform.localRotation = Quaternion.identity;
+        currentTiltAngle = 0f;
+
         if (playerCamera != null)
         {
             savedCamLocalPos = playerCamera.transform.localPosition;
             savedCamLocalRot = playerCamera.transform.localRotation;
-
-            if (pouringCameraAnchor != null)
-            {
-                targetPourCamWorldPos = pouringCameraAnchor.position;
-                targetPourCamWorldRot = pouringCameraAnchor.rotation;
-            }
-            else if (pourAnchor != null)
-            {
-                // Otomatis posisikan kamera sedikit di belakang & atas pourAnchor menghadap area tuang/Beaker
-                Vector3 viewOffset = (-transform.forward * 0.45f) + (Vector3.up * 0.15f);
-                targetPourCamWorldPos = pourAnchor.position + viewOffset;
-                Vector3 lookTarget = pourAnchor.position - (Vector3.up * 0.12f);
-                targetPourCamWorldRot = Quaternion.LookRotation((lookTarget - targetPourCamWorldPos).normalized, Vector3.up);
-            }
         }
-
-        heldObject.transform.SetParent(pourAnchor);
-        heldObject.transform.localPosition = Vector3.zero;
-        heldObject.transform.localRotation = Quaternion.identity;
-        currentTiltAngle = 0f;
 
         currentState = DesktopState.Pouring;
     }
@@ -568,7 +644,6 @@ public class DesktopLabController : MonoBehaviour
         heldObject.transform.localPosition = Vector3.zero;
         heldObject.transform.localRotation = Quaternion.identity;
 
-        // Kembalikan kamera persis ke posisi & sudut pandang FPS semula
         if (playerCamera != null)
         {
             playerCamera.transform.localPosition = savedCamLocalPos;

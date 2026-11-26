@@ -61,13 +61,9 @@ public class AnalyzerSlot : MonoBehaviour
         activeBeaker.transform.position = bottomPos;
 
         // 2. Hitung akurasi & harga, kosongkan cairan, munculkan koin di dalam Beaker
-        if (Mission1Manager.Instance != null)
+        if (RecipeLabManager.Instance != null)
         {
-            pendingCoinReward = Mission1Manager.Instance.EvaluateAccuracyAndPayout(activeBeaker, out _);
-        }
-        else
-        {
-            pendingCoinReward = 50;
+            pendingCoinReward = RecipeLabManager.Instance.EvaluateAccuracyAndPayout(activeBeaker, out _);
         }
 
         activeBeaker.ClearBeaker();

@@ -4,23 +4,87 @@ using TMPro;
 
 public class BeakerContainer : MonoBehaviour
 {
-    [Header("Referensi Visual & UI Gelas")]
+    [Header("Referensi Visual & Teks Melayang (3D TextMeshPro)")]
     public Transform liquidPivot;
     public Renderer liquidRenderer;
-    public TextMeshProUGUI beakerInfoText;
+    public TMP_Text floatingPercentText; // Gunakan 3D TextMeshPro (bukan Canvas UI)
+
+    [Header("Pengaturan Posisi & Tampilan Persentase")]
+    public float hideDelayAfterPour = 0.12f;
+    public float textSideRadius = 0.16f;   // Jarak horizontal dari tengah gelas agar pasti di luar dinding kaca
+    public float textHeightOffset = 0.14f; // Ketinggian angka dari alas bawah Beaker
+
+    [Header("Kalibrasi Tinggi Visual Cairan")]
+    public float minLiquidScaleY = 0.005f;
+    public float maxLiquidScaleY = 0.45f;
 
     [Header("Kapasitas & Batas Luapan (ml)")]
     public float maxVisualVolume = 100f;
     public float overflowLimit = 105f;
     public float currentVolume = 0f;
 
+    
+
     private Dictionary<string, float> liquidVolumes = new Dictionary<string, float>();
     private Dictionary<string, Color> liquidColors = new Dictionary<string, Color>();
+    private float hideTimer = 0f;
 
     void Start()
     {
         UpdateLiquidVisual();
-        UpdateBeakerUI();
+
+        if (floatingPercentText != null)
+        {
+            floatingPercentText.gameObject.SetActive(false);
+        }
+    }
+
+    void Update()
+    {
+        // Sembunyikan angka otomatis begitu cairan berhenti masuk
+        if (hideTimer > 0f)
+        {
+            hideTimer -= Time.deltaTime;
+            if (hideTimer <= 0f && floatingPercentText != null)
+            {
+                floatingPercentText.gameObject.SetActive(false);
+            }
+        }
+    }
+
+    void LateUpdate()
+    {
+        if (floatingPercentText != null && floatingPercentText.gameObject.activeSelf && Camera.main != null)
+        {
+            Transform camTransform = Camera.main.transform;
+            Vector3 beakerBasePos = transform.position;
+
+            // 1. Hitung arah horizontal dari Beaker menuju kamera pemain
+            Vector3 dirToCam = Vector3.ProjectOnPlane(camTransform.position - beakerBasePos, Vector3.up);
+            if (dirToCam.sqrMagnitude < 0.001f)
+                dirToCam = -camTransform.forward;
+            else
+                dirToCam.Normalize();
+
+            // 2. Hitung arah KIRI relatif terhadap pandangan pemain (berlawanan dengan botol yang ada di sisi kanan)
+            Vector3 leftFromPlayerView = Vector3.Cross(Vector3.up, dirToCam).normalized;
+
+            // 3. Tempatkan teks mengorbit di sisi kiri luar gelas + sedikit maju ke arah kamera agar tidak pernah tertutup cairan
+            Vector3 targetTextPos = beakerBasePos
+                                  + (Vector3.up * textHeightOffset)
+                                  + (leftFromPlayerView * textSideRadius)
+                                  + (dirToCam * 0.04f);
+
+            floatingPercentText.transform.position = targetTextPos;
+
+            // 4. Hadapkan teks tegak lurus ke kamera pemain
+            Vector3 lookDir = floatingPercentText.transform.position - camTransform.position;
+            lookDir.y = 0f;
+            if (lookDir.sqrMagnitude > 0.001f)
+            {
+                floatingPercentText.transform.rotation = Quaternion.LookRotation(lookDir);
+            }
+        }
     }
 
     public void AddLiquid(string chemName, float amount, Color addedColor)
@@ -36,10 +100,10 @@ public class BeakerContainer : MonoBehaviour
             return;
         }
 
-        // 2. Cek batas toleransi Misi 1 secara real-time saat penuangan
-        if (Mission1Manager.Instance != null)
+        // 2. Cek batas toleransi resep secara real-time saat penuangan
+        if (RecipeLabManager.Instance != null)
         {
-            if (!Mission1Manager.Instance.ValidateRealTimePour(chemName, projectedChemVol, projectedTotal, out string failReason))
+            if (!RecipeLabManager.Instance.ValidateRealTimePour(chemName, projectedChemVol, projectedTotal, out string failReason))
             {
                 TriggerEvaporation(failReason);
                 return;
@@ -57,7 +121,26 @@ public class BeakerContainer : MonoBehaviour
         }
 
         UpdateLiquidVisual();
-        UpdateBeakerUI();
+        ShowLivePercentage();
+    }
+
+    /// <summary>
+    /// Memunculkan angka persentase total volume gelas hanya selama cairan sedang dituang.
+    /// </summary>
+    private void ShowLivePercentage()
+    {
+        if (floatingPercentText == null) return;
+
+        float fillPercent = Mathf.Clamp((currentVolume / maxVisualVolume) * 100f, 0f, 110f);
+        floatingPercentText.text = $"{fillPercent:F1}%";
+
+        if (!floatingPercentText.gameObject.activeSelf)
+        {
+            floatingPercentText.gameObject.SetActive(true);
+        }
+
+        // Reset timer selama cairan masih terus masuk
+        hideTimer = hideDelayAfterPour;
     }
 
     public float GetPercentageOf(string chemName)
@@ -74,25 +157,6 @@ public class BeakerContainer : MonoBehaviour
                 return true;
         }
         return false;
-    }
-
-    private void UpdateBeakerUI()
-    {
-        if (beakerInfoText == null) return;
-
-        if (currentVolume <= 0.01f)
-        {
-            beakerInfoText.text = "Volume: 0 ml\n(Kosong)";
-            return;
-        }
-
-        string display = $"<b>Total: {currentVolume:F1} ml</b>\n";
-        foreach (var entry in liquidVolumes)
-        {
-            float percent = (entry.Value / currentVolume) * 100f;
-            display += $"• {entry.Key}: {percent:F1}%\n";
-        }
-        beakerInfoText.text = display;
     }
 
     private Color CalculateMixedColor()
@@ -128,8 +192,10 @@ public class BeakerContainer : MonoBehaviour
         if (liquidPivot != null)
         {
             float fillPercentage = Mathf.Clamp01(currentVolume / maxVisualVolume);
-            float targetScaleY = Mathf.Lerp(0.01f, 0.9f, fillPercentage);
-            liquidPivot.localScale = new Vector3(1f, targetScaleY, 1f);
+            float targetScaleY = Mathf.Lerp(minLiquidScaleY, maxLiquidScaleY, fillPercentage);
+
+            Vector3 currentScale = liquidPivot.localScale;
+            liquidPivot.localScale = new Vector3(currentScale.x, targetScaleY, currentScale.z);
         }
 
         if (liquidRenderer != null)
@@ -144,10 +210,6 @@ public class BeakerContainer : MonoBehaviour
     {
         Debug.LogWarning($"MENGUAP HABIS! {reason}");
         ClearBeaker();
-        if (beakerInfoText != null)
-        {
-            beakerInfoText.text = $"<color=yellow>MENGUAP HABIS!\n({reason})</color>";
-        }
     }
 
     public void ClearBeaker()
@@ -155,7 +217,13 @@ public class BeakerContainer : MonoBehaviour
         currentVolume = 0f;
         liquidVolumes.Clear();
         liquidColors.Clear();
+        hideTimer = 0f;
+
+        if (floatingPercentText != null)
+        {
+            floatingPercentText.gameObject.SetActive(false);
+        }
+
         UpdateLiquidVisual();
-        UpdateBeakerUI();
     }
 }
