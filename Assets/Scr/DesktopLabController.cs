@@ -45,6 +45,8 @@ public class DesktopLabController : MonoBehaviour
     public UnityEvent<GameObject> onDesktopGrab;
     public UnityEvent<GameObject> onDesktopRelease;
 
+    // Tambahkan di bagian variabel private atas:
+    private bool isReturningCamera = false;
     private CharacterController characterController;
     private Vector3 verticalVelocity;
 
@@ -88,7 +90,15 @@ public class DesktopLabController : MonoBehaviour
         if (currentState != DesktopState.Pouring)
         {
             HandleMovement();
-            HandleMouseLook();
+
+            if (isReturningCamera)
+            {
+                HandleCameraReturnLerp();
+            }
+            else
+            {
+                HandleMouseLook();
+            }
         }
 
         switch (currentState)
@@ -108,6 +118,36 @@ public class DesktopLabController : MonoBehaviour
             case DesktopState.Placing:
                 HandlePlacingState();
                 break;
+        }
+    }
+
+    private void HandleCameraReturnLerp()
+    {
+        if (playerCamera == null)
+        {
+            isReturningCamera = false;
+            return;
+        }
+
+        playerCamera.transform.localPosition = Vector3.Lerp(
+            playerCamera.transform.localPosition,
+            savedCamLocalPos,
+            Time.deltaTime * cameraLockSpeed
+        );
+
+        playerCamera.transform.localRotation = Quaternion.Slerp(
+            playerCamera.transform.localRotation,
+            savedCamLocalRot,
+            Time.deltaTime * cameraLockSpeed
+        );
+
+        // Hentikan lerp dan kembalikan kontrol mouse penuh saat posisi & rotasi sudah rapat
+        if (Vector3.Distance(playerCamera.transform.localPosition, savedCamLocalPos) < 0.005f &&
+            Quaternion.Angle(playerCamera.transform.localRotation, savedCamLocalRot) < 0.5f)
+        {
+            playerCamera.transform.localPosition = savedCamLocalPos;
+            playerCamera.transform.localRotation = savedCamLocalRot;
+            isReturningCamera = false;
         }
     }
 
@@ -139,6 +179,8 @@ public class DesktopLabController : MonoBehaviour
 
     private void HandleIdleState()
     {
+        if (playerCamera == null) return;
+
         if (pourBluePreview != null) pourBluePreview.SetActive(false);
         DestroyGhostPreview();
         if (crosshairHintText != null) crosshairHintText.text = "";
@@ -146,14 +188,19 @@ public class DesktopLabController : MonoBehaviour
         Ray ray = playerCamera.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0));
         if (Physics.Raycast(ray, out RaycastHit hit, interactRange, ~0, QueryTriggerInteraction.Collide))
         {
+            if (hit.collider == null) return;
+
+            // 1. Cek interaksi jika mengarah ke Slot Analyzer (atau Beaker yang sedang berada di dalam Slot)
             AnalyzerSlot hitSlot = hit.collider.GetComponent<AnalyzerSlot>() ??
                                    hit.collider.GetComponentInParent<AnalyzerSlot>() ??
                                    hit.collider.GetComponentInChildren<AnalyzerSlot>();
 
-            if (hitSlot == null && hit.collider.GetComponent<BeakerContainer>() != null &&
-                analyzerSlot != null && analyzerSlot.IsBusyOrOccupied)
+            BeakerContainer hitBeaker = hit.collider.GetComponent<BeakerContainer>() ??
+                                        hit.collider.GetComponentInParent<BeakerContainer>();
+
+            if (hitSlot == null && hitBeaker != null && analyzerSlot != null && analyzerSlot.IsBusyOrOccupied)
             {
-                if (analyzerAnchor != null && Vector3.Distance(hit.collider.transform.position, analyzerAnchor.position) < 0.5f)
+                if (analyzerAnchor != null && Vector3.Distance(hitBeaker.transform.position, analyzerAnchor.position) < 0.5f)
                 {
                     hitSlot = analyzerSlot;
                 }
@@ -183,34 +230,7 @@ public class DesktopLabController : MonoBehaviour
                 return;
             }
 
-            if (hit.collider.TryGetComponent(out PourDetector detector))
-            {
-                if (crosshairHintText != null)
-                    crosshairHintText.text = $"[E] Ambil {detector.chemicalName}";
-
-                if (Input.GetKeyDown(KeyCode.E))
-                {
-                    PickUpObject(detector.gameObject, DesktopState.HoldingBottle);
-                }
-            }
-            else if (hit.collider.TryGetComponent(out BeakerContainer beaker))
-            {
-                if (crosshairHintText != null)
-                    crosshairHintText.text = "[E] Ambil Gelas Beaker | [R] Buang Isi";
-
-                if (Input.GetKeyDown(KeyCode.E))
-                {
-                    heldBeakerComponent = beaker;
-                    PickUpObject(beaker.gameObject, DesktopState.HoldingBeaker);
-                }
-                else if (Input.GetKeyDown(KeyCode.R))
-                {
-                    beaker.ClearBeaker();
-                }
-            }
-        }
-
-        // Cek interaksi dengan Monitor Komputer LabOS
+            // 2. Cek interaksi dengan Monitor Komputer LabOS
             LabOSInteractable computer = hit.collider.GetComponent<LabOSInteractable>() ??
                                          hit.collider.GetComponentInParent<LabOSInteractable>();
             if (computer != null)
@@ -224,6 +244,39 @@ public class DesktopLabController : MonoBehaviour
                 }
                 return;
             }
+
+            // 3. Cek Botol Kimia (mendukung Collider pada parent maupun child)
+            PourDetector detector = hit.collider.GetComponent<PourDetector>() ??
+                                    hit.collider.GetComponentInParent<PourDetector>();
+            if (detector != null)
+            {
+                if (crosshairHintText != null)
+                    crosshairHintText.text = $"[E] Ambil {detector.chemicalName}";
+
+                if (Input.GetKeyDown(KeyCode.E))
+                {
+                    PickUpObject(detector.gameObject, DesktopState.HoldingBottle);
+                }
+                return;
+            }
+
+            // 4. Cek Gelas Beaker di meja (mendukung Collider pada parent maupun child)
+            if (hitBeaker != null)
+            {
+                if (crosshairHintText != null)
+                    crosshairHintText.text = "[E] Ambil Gelas Beaker | [R] Buang Isi";
+
+                if (Input.GetKeyDown(KeyCode.E))
+                {
+                    heldBeakerComponent = hitBeaker;
+                    PickUpObject(hitBeaker.gameObject, DesktopState.HoldingBeaker);
+                }
+                else if (Input.GetKeyDown(KeyCode.R))
+                {
+                    hitBeaker.ClearBeaker();
+                }
+            }
+        }
     }
 
     private void HandleHoldingBottleState()
@@ -602,7 +655,8 @@ public class DesktopLabController : MonoBehaviour
         if (pourBluePreview != null) pourBluePreview.SetActive(false);
         if (targetPourBeaker == null) return;
 
-        // Hitung posisi akhir botol & kamera dari arah datang pemain saat ini
+        isReturningCamera = false;
+
         CalculateDynamicPourPose(
             targetPourBeaker,
             out Vector3 bottleWorldPos,
@@ -644,12 +698,8 @@ public class DesktopLabController : MonoBehaviour
         heldObject.transform.localPosition = Vector3.zero;
         heldObject.transform.localRotation = Quaternion.identity;
 
-        if (playerCamera != null)
-        {
-            playerCamera.transform.localPosition = savedCamLocalPos;
-            playerCamera.transform.localRotation = savedCamLocalRot;
-        }
-
+        // Mulai transisi lerp halus kembali ke posisi kepala FPS
+        isReturningCamera = true;
         currentState = DesktopState.HoldingBottle;
     }
 }
