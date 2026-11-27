@@ -389,7 +389,7 @@ public class DesktopLabController : MonoBehaviour
         float scroll = Input.mouseScrollDelta.y;
         if (Mathf.Abs(scroll) > 0.01f)
         {
-            currentTiltAngle = Mathf.Clamp(currentTiltAngle + (scroll * scrollTiltSpeed * Time.deltaTime * 10f), 0f, 120f);
+            currentTiltAngle = Mathf.Clamp(currentTiltAngle + (scroll * scrollTiltSpeed * Time.deltaTime * 10f), 0f, 110f);
             // Miringkan ke sumbu Z positif (ke arah kiri/dalam Beaker relatif terhadap kamera)
             heldObject.transform.localRotation = Quaternion.Euler(0f, 0f, currentTiltAngle);
         }
